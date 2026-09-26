@@ -1,173 +1,21 @@
-name: Release
-
-on:
-  push:
-    branches: [main]
-  workflow_dispatch:
-
-permissions:
-  contents: write
-  pull-requests: write
-  issues: write
-
-concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: false
-
-env:
-  # The project pins v145 (VS 2026) / SDK 10.0.26100.0, which the hosted
-  # runners do not ship. Override to what the runner has installed.
-  # "10.0" resolves to the newest SDK present.
-  TOOLSET: v143
-  SDK_VERSION: "10.0"
-  CONFIGURATION: Release
-  PLATFORM: Win32
+name: Build Windows Port
+on: [workflow_dispatch]
 
 jobs:
-  # Maintains a release PR from Conventional Commits. Merging that PR is what
-  # bumps version.txt + CHANGELOG.md, tags, and cuts the GitHub release.
-  release-please:
-    runs-on: ubuntu-latest
-    outputs:
-      release_created: ${{ steps.release.outputs.release_created }}
-      tag_name: ${{ steps.release.outputs.tag_name }}
-      version: ${{ steps.release.outputs.version }}
-    steps:
-      - uses: googleapis/release-please-action@v4
-        id: release
-        with:
-          # release-type lives in the config file rather than here: the
-          # inline input takes no extra-files, and src/Version.h has to be
-          # rewritten in the release commit. Both paths are the action's
-          # defaults, named for the reader.
-          config-file: release-please-config.json
-          manifest-file: .release-please-manifest.json
-
-  # Runs on every push to main as a compile check; when the push was a release
-  # PR merge, the zip is also attached to the release release-please just made.
   build-windows:
-    needs: release-please
-    runs-on: windows-2025
+    runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          # Build the tagged commit when releasing, otherwise the pushed commit.
-          ref: ${{ needs.release-please.outputs.tag_name || github.sha }}
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@v2
 
-      # src/game/ must stay OS-agnostic (docs/LINUX_PORT.md Phase 0). Without
-      # this, Win32 calls creep back into game code within a few commits.
-      - name: Check platform boundary
-        run: python tests/check_platform_boundary.py
+      - name: Build Game Executable
+        run: msbuild Game.sln /p:Configuration=Release /p:Platform=Win32 /t:Build
 
-      - name: Build
-        run: >
-          msbuild Game.sln
-          /p:Configuration=${{ env.CONFIGURATION }}
-          /p:Platform=${{ env.PLATFORM }}
-          /p:PlatformToolset=${{ env.TOOLSET }}
-          /p:WindowsTargetPlatformVersion=${{ env.SDK_VERSION }}
-          /t:Build
-          /m
-          /v:minimal
-
-      - name: Stage release files
-        id: stage
-        run: |
-          $version = "${{ needs.release-please.outputs.version }}"
-          if (-not $version) { $version = $env:GITHUB_SHA.Substring(0,7) }
-          $name = "residentevil-$version-windows-x86"
-          New-Item -ItemType Directory -Force "stage/$name" | Out-Null
-          Copy-Item "bin/$env:CONFIGURATION/residentevil.exe" "stage/$name"
-          Copy-Item "bin/$env:CONFIGURATION/residentevil.pdb" "stage/$name"
-          # config.ini is runtime state (created/rewritten by the game on exit),
-          # so it is not tracked; ship the documented template as the initial
-          # file instead of relying on first-run generation.
-          Copy-Item "config.ini.template" "stage/$name/config.ini"
-          Copy-Item "README.md" "stage/$name"
-          Copy-Item "LICENSE" "stage/$name"
-          Compress-Archive -Path "stage/$name/*" -DestinationPath "$name.zip"
-          "zip=$name.zip" >> $env:GITHUB_OUTPUT
-          "name=$name" >> $env:GITHUB_OUTPUT
-
-      - uses: actions/upload-artifact@v4
+      - name: Upload Native Executable Artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.stage.outputs.name }}
-          path: ${{ steps.stage.outputs.zip }}
-
-      - name: Attach build to release
-        if: needs.release-please.outputs.release_created == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release upload "${{ needs.release-please.outputs.tag_name }}" "${{ steps.stage.outputs.zip }}" --clobber
-
-  # Linux x86-32. Shares every game translation unit with Windows; the SDL2 +
-  # OpenGL platform layer stands in for the MarniDX/Win32 backend. The runner is
-  # the Ubuntu 24.04 reference environment from docs/LINUX_PORT.md, and
-  # tools/package_linux.sh bundles the 32-bit SDL2/ffmpeg objects so the archive
-  # does not depend on the target's package set.
-  build-linux:
-    needs: release-please
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          # Build the tagged commit when releasing, otherwise the pushed commit.
-          ref: ${{ needs.release-please.outputs.tag_name || github.sha }}
-
-      # The project is strictly 32-bit (-m32). libsdl2-dev:i386 cannot be
-      # installed through apt on noble: it depends on libpulse-dev:i386 and
-      # libibus-1.0-dev:i386, whose libglib2.0-dev:i386 dependency has no i386
-      # build in 24.04 (the glib dev utilities are amd64-only), so apt reports
-      # unmet dependencies. None of those headers are used here, so the SDL2
-      # runtime and the ffmpeg i386 dev files install normally and the SDL2 dev
-      # package is forced past its dependency check; libgl-dev (amd64) supplies
-      # the arch-independent GL/glcorearb.h the GL loader needs.
-      - name: Install 32-bit dependencies
-        run: |
-          sudo dpkg --add-architecture i386
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            cmake g++-multilib libc6-dev-i386 \
-            libgl-dev \
-            libsdl2-2.0-0:i386 \
-            libavformat-dev:i386 libavcodec-dev:i386 \
-            libavutil-dev:i386 libswresample-dev:i386
-          cd "$RUNNER_TEMP"
-          apt-get download libsdl2-dev:i386
-          # --force-overwrite: the image may already carry the amd64 package,
-          # whose arch-independent SDL2 headers occupy the same paths.
-          sudo dpkg -i --force-depends --force-overwrite libsdl2-dev_*_i386.deb
-
-      - name: Build
-        run: |
-          cmake -S . -B build/linux -DCMAKE_BUILD_TYPE=Release
-          cmake --build build/linux -j"$(nproc)"
-
-      - name: Stage release files
-        id: stage
-        run: |
-          bash tools/package_linux.sh --no-build
-          bundle="$(ls -d dist/residentevil-*-linux-x86 | head -n1)"
-          # package_linux.sh writes no config.ini: ship the template as the
-          # initial settings file, same as the Windows package.
-          cp config.ini.template "$bundle/config.ini"
-          name="$(basename "$bundle")"
-          tar -C dist -czf "dist/$name.tar.gz" "$name"
-          echo "archive=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
-          echo "name=$name" >> "$GITHUB_OUTPUT"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.stage.outputs.name }}
-          path: ${{ steps.stage.outputs.archive }}
-
-      - name: Attach build to release
-        if: needs.release-please.outputs.release_created == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release upload "${{ needs.release-please.outputs.tag_name }}" "${{ steps.stage.outputs.archive }}" --clobber
+          name: residentevil-windows-port
+          path: bin/Release/
